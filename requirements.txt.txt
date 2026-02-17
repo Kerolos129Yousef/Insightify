@@ -1,0 +1,9 @@
+gradio
+yt-dlp
+openai-whisper
+torch
+transformers
+youtube-transcript-api
+python-docx
+reportlab
+ffmpeg-python

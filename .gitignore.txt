@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# App artifacts
+audio/
+*.wav
+*.mp3
+*.m4a
+*.docx
+*.pdf
+
+# Secrets / env
+.env

@@ -1,0 +1,810 @@
+import gradio as gr
+import os
+import re
+import yt_dlp
+import whisper
+import torch
+from transformers import pipeline
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from docx import Document
+from reportlab.pdfgen import canvas
+from datetime import datetime
+
+# --------------------
+# Setup
+# --------------------
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.makedirs("audio", exist_ok=True)
+
+APP_NAME = "Insightify"
+
+# ✅ Whisper: load safely (GPU->CPU fallback)
+def load_whisper_safely(model_name="base"):
+    try:
+        return whisper.load_model(model_name)
+    except Exception as e:
+        msg = str(e).lower()
+        if "cuda" in msg or "device-side assert" in msg:
+            try:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            except Exception:
+                pass
+            return whisper.load_model(model_name, device="cpu")
+        raise
+
+whisper_model = load_whisper_safely("base")
+
+# ✅ Device for HF pipelines (GPU if available)
+DEVICE = 0 if torch.cuda.is_available() else -1
+
+# ✅ Summarization models (HuggingFace)
+SUM_MODELS = {
+    "BART (High Quality)": "facebook/bart-large-cnn",
+    "DistilBART (Faster)": "sshleifer/distilbart-cnn-12-6",
+}
+
+_SUMMARIZERS = {}
+_TRANSLATORS = {}
+
+TRANSLATION_MODEL = {
+    "English": None,
+    "Arabic": "Helsinki-NLP/opus-mt-en-ar",
+    "French": "Helsinki-NLP/opus-mt-en-fr",
+    "Spanish": "Helsinki-NLP/opus-mt-en-es",
+    "Hindi": "Helsinki-NLP/opus-mt-en-hi",
+    "Korean": "Helsinki-NLP/opus-mt-en-ko",
+    "Chinese": "Helsinki-NLP/opus-mt-en-zh",
+}
+
+# --------------------
+# I18N (UI language labels)
+# --------------------
+I18N = {
+    "English": {
+        "subtitle": "Smart caching: update summary/translation without re-processing the video.",
+        "url": "YouTube Video URL",
+        "audio": "Enable audio fallback (Whisper)",
+        "sum_len": "Summary Length",
+        "ui_lang": "UI Language",
+        "translate_to": "Translate Summary To",
+        "btn_gen": "🚀 Generate",
+        "btn_export": "⬇️ Export Word/PDF",
+        "btn_clear": "🧹 Clear",
+        "btn_example": "📌 Example URL",
+        "btn_copy_sum": "📋 Copy Summary",
+        "btn_copy_tr": "📋 Copy Transcript",
+        "tab_tr": "📝 Transcript",
+        "tab_sum": "✨ Summary",
+        "tab_dl": "⬇️ Downloads",
+        "tr_box": "Transcript",
+        "sum_box": "Summary (Original)",
+        "trn_box": "Summary (Translated)",
+        "word": "Word (.docx)",
+        "pdf": "PDF (.pdf)",
+        "model": "Summarization Model",
+    },
+    "Arabic": {
+        "subtitle": "كاش ذكي: غيّر الملخص/الترجمة بدون إعادة استخراج النص من الفيديو.",
+        "url": "رابط فيديو يوتيوب",
+        "audio": "تفعيل fallback للصوت (Whisper)",
+        "sum_len": "طول الملخص",
+        "ui_lang": "لغة الواجهة",
+        "translate_to": "ترجمة الملخص إلى",
+        "btn_gen": "🚀 توليد",
+        "btn_export": "⬇️ تصدير Word/PDF",
+        "btn_clear": "🧹 مسح",
+        "btn_example": "📌 رابط مثال",
+        "btn_copy_sum": "📋 نسخ الملخص",
+        "btn_copy_tr": "📋 نسخ النص",
+        "tab_tr": "📝 النص (Transcript)",
+        "tab_sum": "✨ الملخص",
+        "tab_dl": "⬇️ التحميل",
+        "tr_box": "النص",
+        "sum_box": "الملخص (الأصلي)",
+        "trn_box": "الملخص (المترجم)",
+        "word": "Word (.docx)",
+        "pdf": "PDF (.pdf)",
+        "model": "موديل التلخيص",
+    },
+    "French": {
+        "subtitle": "Cache intelligent: mettre à jour résumé/traduction sans retraiter la vidéo.",
+        "url": "URL de la vidéo YouTube",
+        "audio": "Activer le fallback audio (Whisper)",
+        "sum_len": "Longueur du résumé",
+        "ui_lang": "Langue de l’interface",
+        "translate_to": "Traduire le résumé vers",
+        "btn_gen": "🚀 Générer",
+        "btn_export": "⬇️ Export Word/PDF",
+        "btn_clear": "🧹 Effacer",
+        "btn_example": "📌 URL d’exemple",
+        "btn_copy_sum": "📋 Copier le résumé",
+        "btn_copy_tr": "📋 Copier la transcription",
+        "tab_tr": "📝 Transcription",
+        "tab_sum": "✨ Résumé",
+        "tab_dl": "⬇️ Téléchargements",
+        "tr_box": "Transcription",
+        "sum_box": "Résumé (Original)",
+        "trn_box": "Résumé (Traduit)",
+        "word": "Word (.docx)",
+        "pdf": "PDF (.pdf)",
+        "model": "Modèle de résumé",
+    },
+    "Spanish": {
+        "subtitle": "Caché inteligente: actualiza resumen/traducción sin reprocesar el video.",
+        "url": "URL del video de YouTube",
+        "audio": "Habilitar fallback de audio (Whisper)",
+        "sum_len": "Longitud del resumen",
+        "ui_lang": "Idioma de la interfaz",
+        "translate_to": "Traducir resumen a",
+        "btn_gen": "🚀 Generar",
+        "btn_export": "⬇️ Exportar Word/PDF",
+        "btn_clear": "🧹 Limpiar",
+        "btn_example": "📌 URL de ejemplo",
+        "btn_copy_sum": "📋 Copiar resumen",
+        "btn_copy_tr": "📋 Copiar transcripción",
+        "tab_tr": "📝 Transcripción",
+        "tab_sum": "✨ Resumen",
+        "tab_dl": "⬇️ Descargas",
+        "tr_box": "Transcripción",
+        "sum_box": "Resumen (Original)",
+        "trn_box": "Resumen (Traducido)",
+        "word": "Word (.docx)",
+        "pdf": "PDF (.pdf)",
+        "model": "Modelo de resumen",
+    },
+    "Hindi": {
+        "subtitle": "स्मार्ट कैश: वीडियो री-प्रोसेस किए बिना सारांश/अनुवाद अपडेट करें।",
+        "url": "YouTube वीडियो URL",
+        "audio": "ऑडियो fallback (Whisper) सक्षम करें",
+        "sum_len": "सारांश की लंबाई",
+        "ui_lang": "UI भाषा",
+        "translate_to": "सारांश का अनुवाद",
+        "btn_gen": "🚀 बनाएं",
+        "btn_export": "⬇️ Word/PDF एक्सपोर्ट",
+        "btn_clear": "🧹 साफ़ करें",
+        "btn_example": "📌 उदाहरण URL",
+        "btn_copy_sum": "📋 सारांश कॉपी",
+        "btn_copy_tr": "📋 ट्रांसक्रिप्ट कॉपी",
+        "tab_tr": "📝 ट्रांसक्रिप्ट",
+        "tab_sum": "✨ सारांश",
+        "tab_dl": "⬇️ डाउनलोड",
+        "tr_box": "ट्रांसक्रिप्ट",
+        "sum_box": "सारांश (मूल)",
+        "trn_box": "सारांश (अनुवाद)",
+        "word": "Word (.docx)",
+        "pdf": "PDF (.pdf)",
+        "model": "Summarization Model",
+    },
+    "Korean": {
+        "subtitle": "스마트 캐시: 영상 재처리 없이 요약/번역만 업데이트.",
+        "url": "YouTube 영상 URL",
+        "audio": "오디오 대체(Whisper) 사용",
+        "sum_len": "요약 길이",
+        "ui_lang": "UI 언어",
+        "translate_to": "요약 번역 대상",
+        "btn_gen": "🚀 생성",
+        "btn_export": "⬇️ Word/PDF 내보내기",
+        "btn_clear": "🧹 지우기",
+        "btn_example": "📌 예시 URL",
+        "btn_copy_sum": "📋 요약 복사",
+        "btn_copy_tr": "📋 자막 복사",
+        "tab_tr": "📝 자막",
+        "tab_sum": "✨ 요약",
+        "tab_dl": "⬇️ 다운로드",
+        "tr_box": "자막",
+        "sum_box": "요약 (원문)",
+        "trn_box": "요약 (번역)",
+        "word": "Word (.docx)",
+        "pdf": "PDF (.pdf)",
+        "model": "요약 모델",
+    },
+    "Chinese": {
+        "subtitle": "智能缓存：不重新处理视频即可更新摘要/翻译。",
+        "url": "YouTube 视频链接",
+        "audio": "启用音频兜底（Whisper）",
+        "sum_len": "摘要长度",
+        "ui_lang": "界面语言",
+        "translate_to": "将摘要翻译为",
+        "btn_gen": "🚀 生成",
+        "btn_export": "⬇️ 导出 Word/PDF",
+        "btn_clear": "🧹 清空",
+        "btn_example": "📌 示例链接",
+        "btn_copy_sum": "📋 复制摘要",
+        "btn_copy_tr": "📋 复制文本",
+        "tab_tr": "📝 文本",
+        "tab_sum": "✨ 摘要",
+        "tab_dl": "⬇️ 下载",
+        "tr_box": "文本",
+        "sum_box": "摘要（原文）",
+        "trn_box": "摘要（翻译）",
+        "word": "Word (.docx)",
+        "pdf": "PDF (.pdf)",
+        "model": "摘要模型",
+    },
+}
+
+# --------------------
+# Helper: robust pipelines (GPU->CPU fallback)
+# --------------------
+def _is_cuda_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("cuda" in msg) or ("device-side assert" in msg) or ("index out of range in self" in msg)
+
+def get_summarizer(model_key: str, force_cpu: bool = False):
+    model_name = SUM_MODELS.get(model_key, "facebook/bart-large-cnn")
+    device_label = "cpu" if force_cpu else ("gpu" if DEVICE == 0 else "cpu")
+    cache_key = (model_name, device_label)
+
+    if cache_key not in _SUMMARIZERS:
+        _SUMMARIZERS[cache_key] = pipeline(
+            "summarization",
+            model=model_name,
+            device=(-1 if force_cpu else DEVICE),
+            batch_size=(1 if force_cpu else 4),
+        )
+    return _SUMMARIZERS[cache_key]
+
+def get_translator(target_lang: str, force_cpu: bool = False):
+    model_name = TRANSLATION_MODEL.get(target_lang)
+    if model_name is None:
+        return None
+    device_label = "cpu" if force_cpu else ("gpu" if DEVICE == 0 else "cpu")
+    cache_key = (model_name, device_label)
+    if cache_key not in _TRANSLATORS:
+        _TRANSLATORS[cache_key] = pipeline(
+            "translation",
+            model=model_name,
+            device=(-1 if force_cpu else DEVICE),
+        )
+    return _TRANSLATORS[cache_key]
+
+# --------------------
+# Core functions
+# --------------------
+def extract_video_id(url: str) -> str:
+    m = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
+    if not m:
+        raise ValueError("Invalid YouTube URL")
+    return m.group(1)
+
+# ✅ iFrame preview only (no thumbnail)
+def video_preview(url: str):
+    if not url or len(url.strip()) < 10:
+        return ""
+    try:
+        vid = extract_video_id(url)
+        return f"""
+        <div style="margin-top:10px;">
+          <iframe width="100%" height="420"
+            src="https://www.youtube.com/embed/{vid}"
+            title="YouTube video player"
+            frameborder="0"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowfullscreen
+            style="border-radius:14px;box-shadow:0 12px 30px rgba(0,0,0,.18);">
+          </iframe>
+        </div>
+        """
+    except Exception:
+        return ""
+
+# ✅ Clean transcript to remove quiz/Q&A parts and reduce repetition
+def clean_transcript(text: str) -> str:
+    if not text:
+        return ""
+    patterns = [
+        "Now, let's go on to this video’s quiz",
+        "Now, let's go on to this video's quiz",
+        "Now, let's go on to the quiz",
+        "Select the best answer",
+        "Pause the video to think about your answer",
+        "Let's go on to the next question",
+        "Let's go to the next question",
+        "Let's go to the final quiz question",
+    ]
+    cut_idx = None
+    for p in patterns:
+        idx = text.find(p)
+        if idx != -1:
+            cut_idx = idx if (cut_idx is None) else min(cut_idx, idx)
+    if cut_idx is not None and cut_idx > 200:
+        text = text[:cut_idx]
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def get_captions(video_id: str) -> str:
+    try:
+        ytt_api = YouTubeTranscriptApi()
+        transcript_list = ytt_api.list(video_id)
+        try:
+            transcript = transcript_list.find_manually_created_transcript(["en"])
+        except NoTranscriptFound:
+            transcript = transcript_list.find_generated_transcript(["en"])
+        fetched = transcript.fetch()
+
+        parts = []
+        for t in fetched:
+            if isinstance(t, dict):
+                parts.append(t.get("text", ""))
+            else:
+                parts.append(getattr(t, "text", ""))
+        return " ".join(parts).strip()
+    except (TranscriptsDisabled, NoTranscriptFound):
+        raise RuntimeError("Captions not available for this video")
+
+def download_audio(youtube_url: str) -> str:
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": "audio/audio.%(ext)s",
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+        "quiet": True,
+        "noplaylist": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([youtube_url])
+    return "audio/audio.wav"
+
+def transcribe_audio(audio_path: str) -> str:
+    try:
+        result = whisper_model.transcribe(audio_path)
+        return result.get("text", "")
+    except Exception as e:
+        return f"⚠️ Whisper failed: {str(e)}"
+
+# ✅✅ FIXED: safe chunking (prevents index out of range)
+def summarize_text(text: str, style: str = "Normal", model_key: str = "BART (High Quality)") -> str:
+    if not text or len(text.strip()) < 80:
+        return "Text is too short to summarize."
+
+    presets = {
+        "Short":   {"max_len": 90,  "min_len": 30,  "chunk_tokens": 750, "second_pass": False},
+        "Normal":  {"max_len": 150, "min_len": 50,  "chunk_tokens": 850, "second_pass": True},
+        "Detailed":{"max_len": 220, "min_len": 90,  "chunk_tokens": 900, "second_pass": True},
+    }
+    cfg = presets.get(style, presets["Normal"])
+
+    def _run(summarizer):
+        tokenizer = summarizer.tokenizer
+        model_max = getattr(tokenizer, "model_max_length", 1024)
+        safe_chunk = min(cfg["chunk_tokens"], max(256, model_max - 32))
+
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+
+        chunks = []
+        for i in range(0, len(tokens), safe_chunk):
+            chunk_tokens = tokens[i:i + safe_chunk]
+            if not chunk_tokens:
+                continue
+            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True).strip()
+            if len(chunk_text) >= 30:
+                chunks.append(chunk_text)
+
+        if not chunks:
+            return "Could not generate summary."
+
+        outs = summarizer(
+            chunks,
+            max_length=cfg["max_len"],
+            min_length=min(cfg["min_len"], max(10, cfg["max_len"] - 20)),
+            do_sample=False,
+            truncation=True
+        )
+        partial = [o.get("summary_text", "").strip() for o in outs if o.get("summary_text")]
+        combined = " ".join(partial).strip()
+
+        if cfg["second_pass"] and len(partial) >= 2 and len(combined) > 250:
+            out2 = summarizer(
+                combined,
+                max_length=min(cfg["max_len"] + 60, 240),
+                min_length=min(cfg["min_len"] + 20, 120),
+                do_sample=False,
+                truncation=True
+            )
+            return out2[0]["summary_text"].strip()
+
+        return combined if combined else "Could not generate summary."
+
+    try:
+        s = get_summarizer(model_key, force_cpu=False)
+        return _run(s)
+    except Exception as e:
+        if _is_cuda_error(e):
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            s_cpu = get_summarizer(model_key, force_cpu=True)
+            return _run(s_cpu)
+        raise
+
+def translate_summary(text: str, target_lang: str) -> str:
+    if not text.strip():
+        return ""
+
+    model_name = TRANSLATION_MODEL.get(target_lang)
+    if model_name is None:
+        return text
+
+    def _run(translator):
+        chunks = [text[i:i+1200] for i in range(0, len(text), 1200)]
+        outs = []
+        for ch in chunks:
+            res = translator(ch, max_length=512)
+            outs.append(res[0]["translation_text"])
+        return "\n".join(outs).strip()
+
+    try:
+        tr = get_translator(target_lang, force_cpu=False)
+        return _run(tr)
+    except Exception as e:
+        if _is_cuda_error(e):
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            tr_cpu = get_translator(target_lang, force_cpu=True)
+            return _run(tr_cpu)
+        return f"⚠️ Translation unavailable for {target_lang}: {str(e)}"
+
+def translate_only(summary_text: str, target_lang: str):
+    if not summary_text.strip():
+        return ""
+    return translate_summary(summary_text, target_lang)
+
+def update_summary_only(summary_style: str, cache: dict, translate_to: str, model_key: str):
+    if not cache or not cache.get("transcript"):
+        return "⚠️ No transcript cached. Click Generate first.", "", ""
+
+    cache.setdefault("summaries", {})
+    cache["summaries"].setdefault(model_key, {})
+
+    if cache["summaries"][model_key].get(summary_style):
+        summary = cache["summaries"][model_key][summary_style]
+    else:
+        summary = summarize_text(cache["transcript"], style=summary_style, model_key=model_key)
+        cache["summaries"][model_key][summary_style] = summary
+
+    translated = translate_summary(summary, translate_to)
+    status = f"✅ Summary updated | Model: {model_key} | Style: {summary_style} | Translate: {translate_to}"
+    return status, summary, translated
+
+def safe_filename(prefix: str) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{prefix}_{ts}"
+
+def save_as_word(transcript: str, summary: str, base_name: str) -> str:
+    doc = Document()
+    doc.add_heading(APP_NAME, level=1)
+    doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    doc.add_paragraph("")
+    doc.add_heading("Transcript", level=2)
+    doc.add_paragraph(transcript)
+    doc.add_heading("Summary", level=2)
+    doc.add_paragraph(summary)
+    path = f"{base_name}.docx"
+    doc.save(path)
+    return path
+
+def save_as_pdf(transcript: str, summary: str, base_name: str) -> str:
+    path = f"{base_name}.pdf"
+    c = canvas.Canvas(path)
+
+    def draw_wrapped(text, y, font="Helvetica", size=10, max_chars=110, line_height=14):
+        c.setFont(font, size)
+        for paragraph in text.split("\n"):
+            words = paragraph.split()
+            line = ""
+            for w in words:
+                test = (line + " " + w).strip()
+                if len(test) > max_chars:
+                    c.drawString(50, y, line)
+                    y -= line_height
+                    line = w
+                else:
+                    line = test
+                if y < 50:
+                    c.showPage()
+                    c.setFont(font, size)
+                    y = 800
+            if line:
+                c.drawString(50, y, line)
+                y -= line_height
+            y -= 6
+            if y < 50:
+                c.showPage()
+                c.setFont(font, size)
+                y = 800
+        return y
+
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(50, 800, APP_NAME)
+    c.setFont("Helvetica", 10)
+    c.drawString(50, 782, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    y = 760
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, "Transcript")
+    y -= 20
+    y = draw_wrapped(transcript, y)
+
+    y -= 10
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, "Summary")
+    y -= 20
+    draw_wrapped(summary, y)
+
+    c.save()
+    return path
+
+def generate(url: str, allow_audio_fallback: bool, summary_style: str, translate_to: str, model_key: str, cache: dict):
+    try:
+        if not url or len(url.strip()) < 10:
+            raise ValueError("Please paste a valid YouTube URL.")
+
+        need_extract = (not cache) or (cache.get("url") != url) or (not cache.get("transcript"))
+
+        if need_extract:
+            video_id = extract_video_id(url)
+            try:
+                transcript_raw = get_captions(video_id)
+                source = "✅ Captions used"
+            except RuntimeError:
+                if not allow_audio_fallback:
+                    raise RuntimeError("Captions unavailable and audio fallback disabled.")
+                audio_path = download_audio(url)
+                transcript_raw = transcribe_audio(audio_path)
+                source = "⚠️ Audio fallback (Whisper)"
+
+            transcript = clean_transcript(transcript_raw)
+
+            cache = {
+                "url": url,
+                "video_id": video_id,
+                "source": source,
+                "transcript": transcript,
+                "summaries": {}
+            }
+            extract_note = "Transcript extracted + cleaned"
+        else:
+            extract_note = "Transcript reused from cache"
+            cache.setdefault("summaries", {})
+
+        transcript_text = f"{cache['source']}\nVideo ID: {cache['video_id']}\n\n{cache['transcript']}"
+
+        cache["summaries"].setdefault(model_key, {})
+        if cache["summaries"][model_key].get(summary_style):
+            summary = cache["summaries"][model_key][summary_style]
+        else:
+            summary = summarize_text(cache["transcript"], style=summary_style, model_key=model_key)
+            cache["summaries"][model_key][summary_style] = summary
+
+        translated = translate_summary(summary, translate_to)
+        status = f"✅ Done | {extract_note} | Model: {model_key} | Summary: {summary_style} | Translate: {translate_to}"
+        return status, transcript_text, summary, translated, cache
+
+    except Exception as e:
+        return f"❌ Error: {str(e)}", "", "", "", cache
+
+def export_files(cache: dict, summary_text: str, translated_text: str, translate_to: str):
+    try:
+        if not cache or not cache.get("transcript"):
+            raise RuntimeError("No cached transcript. Click Generate first.")
+
+        transcript_text = f"{cache['source']}\nVideo ID: {cache['video_id']}\n\n{cache['transcript']}"
+        export_summary = translated_text if (translate_to != "English" and translated_text.strip()) else summary_text
+
+        base = safe_filename("insightify")
+        word_file = save_as_word(transcript_text, export_summary, base)
+        pdf_file = save_as_pdf(transcript_text, export_summary, base)
+
+        return "✅ Export ready.", word_file, pdf_file
+    except Exception as e:
+        return f"❌ Error: {str(e)}", None, None
+
+def fill_example():
+    return "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+def apply_ui_language(lang: str):
+    t = I18N.get(lang, I18N["English"])
+    return (
+        gr.update(value=f"<div id='subtitle'>{t['subtitle']}</div>"),
+        gr.update(label=t["url"]),
+        gr.update(label=t["audio"]),
+        gr.update(label=t["sum_len"]),
+        gr.update(label=t["ui_lang"]),
+        gr.update(label=t["translate_to"]),
+        gr.update(value=t["btn_gen"]),
+        gr.update(value=t["btn_export"]),
+        gr.update(value=t["btn_clear"]),
+        gr.update(value=t["btn_example"]),
+        gr.update(value=t["btn_copy_sum"]),
+        gr.update(value=t["btn_copy_tr"]),
+        gr.update(label=t["tab_tr"]),
+        gr.update(label=t["tab_sum"]),
+        gr.update(label=t["tab_dl"]),
+        gr.update(label=t["tr_box"]),
+        gr.update(label=t["sum_box"]),
+        gr.update(label=t["trn_box"]),
+        gr.update(label=t["word"]),
+        gr.update(label=t["pdf"]),
+        gr.update(label=t.get("model", "Summarization Model")),
+    )
+
+# --------------------
+# UI
+# --------------------
+CUSTOM_CSS = """
+body {
+  background: radial-gradient(1200px circle at 10% 10%, rgba(59,130,246,.22), transparent 40%),
+              radial-gradient(1200px circle at 90% 20%, rgba(168,85,247,.20), transparent 45%),
+              radial-gradient(1200px circle at 50% 90%, rgba(14,165,233,.18), transparent 45%);
+}
+#header { display:flex; gap:12px; align-items:center; justify-content:center; width:100%; margin-top:10px; margin-bottom:6px; }
+#subtitle { text-align:center; opacity:.86; margin-bottom:16px; }
+.logo { width:38px; height:38px; border-radius:12px; background: linear-gradient(135deg, #3b82f6, #a855f7); box-shadow: 0 12px 30px rgba(0,0,0,.12); }
+.brand { font-size:30px; font-weight:900; letter-spacing:.4px; text-align:center; }
+.gradio-container {
+  width: min(1400px, 96vw) !important;
+  margin: 0 auto !important;
+  padding: 0 !important;
+}
+"""
+
+insightify_theme = gr.themes.Soft(primary_hue="blue", secondary_hue="purple", neutral_hue="slate")
+
+with gr.Blocks(title=APP_NAME) as demo:
+    gr.Markdown("<div id='header'><div class='logo'></div><div class='brand'>Insightify</div></div>")
+    subtitle_md = gr.Markdown("<div id='subtitle'>Smart caching: update summary/translation without re-processing the video.</div>")
+
+    cache_state = gr.State({})
+
+    with gr.Row():
+        with gr.Column(scale=7):
+            url_input = gr.Textbox(label="YouTube Video URL", placeholder="https://www.youtube.com/watch?v=...")
+            iframe_html = gr.HTML()  # ✅ iFrame preview under URL
+
+        with gr.Column(scale=3):
+            ui_lang = gr.Dropdown(label="UI Language", choices=list(I18N.keys()), value="English", interactive=True)
+            audio_toggle = gr.Checkbox(label="Enable audio fallback (Whisper)", value=False)
+
+            model_choice = gr.Dropdown(
+                label="Summarization Model",
+                choices=list(SUM_MODELS.keys()),
+                value="BART (High Quality)",
+                interactive=True
+            )
+            summary_style = gr.Dropdown(label="Summary Length", choices=["Short", "Normal", "Detailed"], value="Normal", interactive=True)
+            translate_to = gr.Dropdown(label="Translate Summary To", choices=list(TRANSLATION_MODEL.keys()), value="English", interactive=True)
+
+    with gr.Row():
+        run_btn = gr.Button("🚀 Generate", variant="primary")
+        export_btn = gr.Button("⬇️ Export Word/PDF", variant="secondary")
+        clear_btn = gr.Button("🧹 Clear", variant="secondary")
+        example_btn = gr.Button("📌 Example URL", variant="secondary")
+        copy_sum_btn = gr.Button("📋 Copy Summary", variant="secondary")
+        copy_tr_btn = gr.Button("📋 Copy Transcript", variant="secondary")
+
+    status = gr.Markdown("")
+
+    with gr.Tabs():
+        with gr.TabItem("📝 Transcript") as tab_tr:
+            transcript_output = gr.Textbox(label="Transcript", lines=22, max_lines=22, elem_id="transcript_box")
+        with gr.TabItem("✨ Summary") as tab_sum:
+            summary_output = gr.Textbox(label="Summary (Original)", lines=10, max_lines=10, elem_id="summary_box")
+            translated_output = gr.Textbox(label="Summary (Translated)", lines=10, max_lines=10, elem_id="translated_box")
+        with gr.TabItem("⬇️ Downloads") as tab_dl:
+            word_download = gr.File(label="Word (.docx)")
+            pdf_download = gr.File(label="PDF (.pdf)")
+
+    # Preview updates when URL changes
+    url_input.change(fn=video_preview, inputs=[url_input], outputs=[iframe_html])
+
+    # Auto-translate when translate dropdown changes
+    translate_to.change(fn=translate_only, inputs=[summary_output, translate_to], outputs=[translated_output])
+
+    # Auto-update summary when size changes (uses cache)
+    summary_style.change(
+        fn=update_summary_only,
+        inputs=[summary_style, cache_state, translate_to, model_choice],
+        outputs=[status, summary_output, translated_output]
+    )
+
+    # Changing model updates summary (cache per model/style)
+    model_choice.change(
+        fn=update_summary_only,
+        inputs=[summary_style, cache_state, translate_to, model_choice],
+        outputs=[status, summary_output, translated_output]
+    )
+
+    # Generate
+    run_btn.click(
+        fn=generate,
+        inputs=[url_input, audio_toggle, summary_style, translate_to, model_choice, cache_state],
+        outputs=[status, transcript_output, summary_output, translated_output, cache_state],
+    )
+
+    # Also refresh preview on Generate
+    run_btn.click(fn=video_preview, inputs=[url_input], outputs=[iframe_html])
+
+    # Export
+    export_btn.click(
+        fn=export_files,
+        inputs=[cache_state, summary_output, translated_output, translate_to],
+        outputs=[status, word_download, pdf_download],
+    )
+
+    # Clear (also clear iframe)
+    clear_btn.click(
+        fn=lambda: ("", "", "", "", None, None, {}, ""),
+        inputs=[],
+        outputs=[status, transcript_output, summary_output, translated_output, word_download, pdf_download, cache_state, iframe_html],
+    )
+
+    # Example
+    example_btn.click(fn=fill_example, inputs=[], outputs=[url_input])
+
+    # Copy Summary
+    copy_sum_btn.click(
+        fn=lambda: "",
+        inputs=[],
+        outputs=[],
+        js=r"""
+        () => {
+          const el = document.querySelector("#translated_box textarea") || document.querySelector("#summary_box textarea");
+          const txt = el ? el.value : "";
+          if (!txt) return "";
+          navigator.clipboard.writeText(txt);
+          return "";
+        }
+        """
+    )
+
+    # Copy Transcript
+    copy_tr_btn.click(
+        fn=lambda: "",
+        inputs=[],
+        outputs=[],
+        js=r"""
+        () => {
+          const el = document.querySelector("#transcript_box textarea");
+          const txt = el ? el.value : "";
+          if (!txt) return "";
+          navigator.clipboard.writeText(txt);
+          return "";
+        }
+        """
+    )
+
+    # UI language change (labels)
+    ui_lang.change(
+        fn=apply_ui_language,
+        inputs=[ui_lang],
+        outputs=[
+            subtitle_md,
+            url_input,
+            audio_toggle,
+            summary_style,
+            ui_lang,
+            translate_to,
+            run_btn,
+            export_btn,
+            clear_btn,
+            example_btn,
+            copy_sum_btn,
+            copy_tr_btn,
+            tab_tr,
+            tab_sum,
+            tab_dl,
+            transcript_output,
+            summary_output,
+            translated_output,
+            word_download,
+            pdf_download,
+            model_choice,
+        ],
+    )
+
+if __name__ == "__main__":
+    demo.launch(css=CUSTOM_CSS, theme=insightify_theme)
