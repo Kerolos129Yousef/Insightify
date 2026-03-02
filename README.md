@@ -56,6 +56,7 @@ git clone https://github.com/yourusername/Insightify.git
 cd Insightify
 pip install -r requirements.txt
 python app.py
+```
 
 ---
 
