@@ -60,7 +60,7 @@ python app.py
 
 ---
 
-## Demo ⚡
+## Demo  🎥
 
 
 Here’s a live preview of the app in action:
@@ -73,7 +73,7 @@ Here’s a live preview of the app in action:
 
 ## Example
 
-**Input YouTube URL: https://www.youtube.com/watch?v=FU_0NF_jrgE **
+Input YouTube URL: https: //www.youtube.com/watch?v=FU_0NF_jrgE
 ---
 
 **Output:**  
