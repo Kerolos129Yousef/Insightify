@@ -36,7 +36,7 @@
 
 ## How It Works 🛠️
 
-![Workflow Diagram](path_to_your_workflow_image.png)
+![Workflow Diagram](mermaid-diagram.png)
 
 **Step-by-step workflow:**  
 
